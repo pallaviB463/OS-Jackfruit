@@ -39,6 +39,17 @@
  *   - remember whether the soft-limit warning was already emitted
  *   - include `struct list_head` linkage
  * ============================================================== */
+struct monitor_entry {
+    pid_t pid;
+    char container_id[32];
+
+    unsigned long soft_limit;
+    unsigned long hard_limit;
+
+    int soft_warned;
+
+    struct list_head list;
+};
 
 
 /* ==============================================================
@@ -51,6 +62,8 @@
  * You may choose either a mutex or a spinlock, but your README must
  * justify the choice in terms of the code paths you implemented.
  * ============================================================== */
+static LIST_HEAD(monitor_list);
+static DEFINE_MUTEX(monitor_lock);
 
 
 /* --- Provided: internal device / timer state --- */
@@ -133,6 +146,36 @@ static void kill_process(const char *container_id,
  * --------------------------------------------------------------- */
 static void timer_callback(struct timer_list *t)
 {
+    struct monitor_entry *entry, *tmp;
+
+mutex_lock(&monitor_lock);
+
+list_for_each_entry_safe(entry, tmp, &monitor_list, list) {
+
+    long rss = get_rss_bytes(entry->pid);
+
+    if (rss < 0) {
+        list_del(&entry->list);
+        kfree(entry);
+        continue;
+    }
+
+    if (!entry->soft_warned && rss > entry->soft_limit) {
+        log_soft_limit_event(entry->container_id, entry->pid,
+                             entry->soft_limit, rss);
+        entry->soft_warned = 1;
+    }
+
+    if (rss > entry->hard_limit) {
+        kill_process(entry->container_id, entry->pid,
+                     entry->hard_limit, rss);
+
+        list_del(&entry->list);
+        kfree(entry);
+    }
+}
+
+mutex_unlock(&monitor_lock);
     /* ==============================================================
      * TODO 3: Implement periodic monitoring.
      *
@@ -170,7 +213,26 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         printk(KERN_INFO
                "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
                req.container_id, req.pid, req.soft_limit_bytes, req.hard_limit_bytes);
+        struct monitor_entry *entry;
 
+        entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry)
+           return -ENOMEM;
+
+        /* Initialize */
+        entry->pid = req.pid;
+        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id));
+        entry->container_id[sizeof(entry->container_id) - 1] = '\0';
+
+        entry->soft_limit = req.soft_limit_bytes;
+        entry->hard_limit = req.hard_limit_bytes;
+        entry->soft_warned = 0;
+
+        mutex_lock(&monitor_lock);
+        list_add(&entry->list, &monitor_list);
+        mutex_unlock(&monitor_lock);
+
+        return 0;
         /* ==============================================================
          * TODO 4: Add a monitored entry.
          *
@@ -186,7 +248,21 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     printk(KERN_INFO
            "[container_monitor] Unregister request container=%s pid=%d\n",
            req.container_id, req.pid);
+    struct monitor_entry *entry, *tmp;
 
+    mutex_lock(&monitor_lock);
+
+    list_for_each_entry_safe(entry, tmp, &monitor_list, list) {
+        if (entry->pid == req.pid) {
+           list_del(&entry->list);
+           kfree(entry);
+           mutex_unlock(&monitor_lock);
+           return 0;
+        }
+    }
+
+    mutex_unlock(&monitor_lock);
+    return -ENOENT;
     /* ==============================================================
      * TODO 5: Remove a monitored entry on explicit unregister.
      *
@@ -254,7 +330,15 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+    struct monitor_entry *entry, *tmp;
 
+    mutex_lock(&monitor_lock);
+
+    list_for_each_entry_safe(entry, tmp, &monitor_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    mutex_unlock(&monitor_lock);
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
     class_destroy(cl);
