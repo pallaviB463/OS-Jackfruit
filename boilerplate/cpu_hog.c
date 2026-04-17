@@ -48,3 +48,4 @@ int main(int argc, char *argv[])
     printf("cpu_hog done duration=%u accumulator=%llu\n", duration, accumulator);
     return 0;
 }
+
