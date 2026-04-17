@@ -23,3 +23,4 @@ struct monitor_request {
 #define MONITOR_UNREGISTER _IOW(MONITOR_MAGIC, 2, struct monitor_request)
 
 #endif
+
